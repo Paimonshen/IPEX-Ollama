@@ -114,7 +114,7 @@ git apply ollama-sycl.patch
 2. 仓库 Settings → Branches → 为 `main` 添加规则 → 勾选 **Require status checks to pass before merging** → 添加构建检查 `Build Windows (SYCL / Intel oneAPI)`
 3. Actions 页 → **Sync upstream** → **Run workflow** 跑一次
 
-之后打 `v*` 标签即自动云编译并发布 Release（版本号自动取上游最新标签）。若同步 PR 出现冲突（上游改了 SYCL 相关文件），自动合并会暂停，`main` 不受影响，可在 PR 页面手动解决或用上面的 `update_upstream.bat` 处理。
+同步 PR 合入 `main` 后，`auto-release` workflow 会自动打 `v<版本>-<日期>` 标签并触发云编译，Release 自动发布（zip 挂在附件）；也可在 Actions 页手动运行 **Auto release** 立即发一版（同一天重复运行会自动跳过）。手动打 `v*` 标签同样有效。若同步 PR 出现冲突（上游改了 SYCL 相关文件），自动合并会暂停，`main` 不受影响，可在 PR 页面手动解决或用上面的 `update_upstream.bat` 处理。
 
 ## 致谢
 
