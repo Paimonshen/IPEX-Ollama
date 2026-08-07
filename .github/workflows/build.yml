@@ -1,0 +1,68 @@
+name: Build Windows (SYCL / Intel oneAPI)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      OLLAMA_VERSION: 0.32.6
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC (cl)
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Intel oneAPI Base Toolkit
+        shell: powershell
+        run: |
+          $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/076e961b-2c29-48a8-9203-c96f00e7051b/intel-oneapi-base-toolkit-2025.3.1.35_offline.exe"
+          Invoke-WebRequest -Uri $url -OutFile oneapi.exe
+          # Same component set used by llama.cpp's official Windows SYCL CI.
+          # Colons are the separator the Intel installer expects.
+          $components = "intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.mkl.devel:intel.oneapi.win.dnnl:intel.oneapi.win.tbb.devel"
+          & .\oneapi.exe -s --action install --components $components --eula accept
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Component install failed, falling back to full Base Toolkit install"
+            & .\oneapi.exe -s --action install --eula accept
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Configure
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force >nul
+          cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DOLLAMA_LLAMA_BACKENDS=sycl -DOLLAMA_VERSION=%OLLAMA_VERSION% -DCMAKE_BUILD_TYPE=Release -DGGML_CCACHE=OFF
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force >nul
+          cmake --build build --config Release --parallel 2
+
+      - name: Assemble package
+        shell: powershell
+        run: |
+          $out = "release\IPEX-Ollama"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item ollama.exe $out\
+          Copy-Item build\lib\ollama "$out\lib\ollama" -Recurse -Force
+          Set-Content -Path "$out\start-ollama.bat" -Value "@echo off`r`ncd /d `"%~dp0`"`r`nollama serve`r`n" -Encoding ascii
+          Compress-Archive -Path $out -DestinationPath release\IPEX-Ollama.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPEX-Ollama
+          path: release/IPEX-Ollama.zip
+
+      - name: Publish GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/IPEX-Ollama.zip
