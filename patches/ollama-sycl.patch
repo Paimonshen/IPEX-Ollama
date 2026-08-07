@@ -1,0 +1,313 @@
+diff --git a/cmake/local.cmake b/cmake/local.cmake
+index 67de4e3..1c42af1 100644
+--- a/cmake/local.cmake
++++ b/cmake/local.cmake
+@@ -7,7 +7,7 @@
+ include(ExternalProject)
+ 
+ set(OLLAMA_LLAMA_BACKENDS "" CACHE STRING
+-    "Semicolon-separated llama-server GPU backends to build: cuda_v12;cuda_v13;rocm_v7_1;rocm_v7_2;vulkan;cuda_jetpack5;cuda_jetpack6")
++    "Semicolon-separated llama-server GPU backends to build: cuda_v12;cuda_v13;rocm_v7_1;rocm_v7_2;vulkan;sycl;cuda_jetpack5;cuda_jetpack6")
+ set(_ollama_mlx_backends_doc "Semicolon-separated MLX backends to build: cuda_v13;metal_v3;metal_v4")
+ set(OLLAMA_VERSION "0.0.0" CACHE STRING "Ollama version embedded in the local Go binary")
+ set(OLLAMA_PAYLOAD_INSTALL_PREFIX "${CMAKE_BINARY_DIR}" CACHE PATH
+@@ -361,7 +361,7 @@ function(ollama_rocm_preset backend output)
+ endfunction()
+ 
+ function(ollama_add_llama_server_build name)
+-    cmake_parse_arguments(ARG "" "PRESET;RUNNER_DIR" "TARGETS;CMAKE_ARGS" ${ARGN})
++    cmake_parse_arguments(ARG "" "PRESET;RUNNER_DIR;GENERATOR" "TARGETS;CMAKE_ARGS" ${ARGN})
+     if(NOT ARG_TARGETS)
+         message(FATAL_ERROR "ollama_add_llama_server_build(${name}) requires TARGETS")
+     endif()
+@@ -372,8 +372,36 @@ function(ollama_add_llama_server_build name)
+     else()
+         set(_build_dir ${CMAKE_BINARY_DIR}/llama-server-${name})
+     endif()
++
++    # Nested builds explicitly inherit the superbuild's generator (and
++    # platform) instead of falling back to CMake's default, which on Windows
++    # silently switches to Visual Studio. Some backends (e.g. SYCL/oneAPI)
++    # override with their own generator so their toolchain can drive the
++    # build directly.
++    set(_generator_override_args)
++    if(ARG_GENERATOR)
++        list(APPEND _generator_override_args -G "${ARG_GENERATOR}")
++    elseif(CMAKE_GENERATOR)
++        list(APPEND _generator_override_args -G "${CMAKE_GENERATOR}")
++        if(CMAKE_GENERATOR_PLATFORM)
++            list(APPEND _generator_override_args -A "${CMAKE_GENERATOR_PLATFORM}")
++        endif()
++    endif()
+     ollama_collect_cache_args_with_prefix("GGML_" _ggml_cache_args)
+     ollama_collect_cache_args_with_prefix("LLAMA_" _llama_cache_args)
++    # Forward the superbuild's MSVC compiler by short name so nested Ninja
++    # builds do not fall back to another toolchain found earlier in PATH
++    # (e.g. MinGW gcc). The short name resolves through vcvars at configure
++    # time; passing the resolved full path would trigger MSBuild-based
++    # compiler checks. Backend-specific CMAKE_ARGS (e.g. SYCL's icx) are
++    # appended later and take precedence.
++    set(_cmake_compiler_args)
++    if(WIN32 AND CMAKE_C_COMPILER MATCHES "cl\\.exe$")
++        list(APPEND _cmake_compiler_args -DCMAKE_C_COMPILER=cl)
++    endif()
++    if(WIN32 AND CMAKE_CXX_COMPILER MATCHES "cl\\.exe$")
++        list(APPEND _cmake_compiler_args -DCMAKE_CXX_COMPILER=cl)
++    endif()
+     set(_cmake_args
+         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+         -DCMAKE_INSTALL_PREFIX=${OLLAMA_PAYLOAD_INSTALL_PREFIX}
+@@ -383,6 +411,7 @@ function(ollama_add_llama_server_build name)
+         -DOLLAMA_LLAMA_CPP_SKIP_COMPAT_PATCH=ON
+         -DGGML_NATIVE=OFF
+         -DGGML_OPENMP=OFF
++        ${_cmake_compiler_args}
+         ${ARG_CMAKE_ARGS}
+         ${_ggml_cache_args}
+         ${_llama_cache_args}
+@@ -402,7 +431,7 @@ function(ollama_add_llama_server_build name)
+     # MSBuild's CUDA integration ignores -DCUDAToolkit_ROOT for nvcc selection.
+     # Prefer user-specified CUDAToolkit_ROOT before falling back to auto-discovery.
+     set(_generator_args)
+-    if(WIN32 AND CMAKE_GENERATOR MATCHES "Visual Studio")
++    if(NOT ARG_GENERATOR AND WIN32 AND CMAKE_GENERATOR MATCHES "Visual Studio")
+         set(_cuda_root "${CUDAToolkit_ROOT}")
+         if("${_cuda_root}" STREQUAL "")
+             ollama_backend_cuda_major("${name}" _cuda_major)
+@@ -413,12 +442,14 @@ function(ollama_add_llama_server_build name)
+         endif()
+     endif()
+     set(_configure_command ${CMAKE_COMMAND}
++        ${_generator_override_args}
+         ${_generator_args}
+         -S ${CMAKE_SOURCE_DIR}/llama/server
+         -B <BINARY_DIR>
+         ${_cmake_args})
+     if(ARG_PRESET)
+         set(_configure_command ${CMAKE_COMMAND}
++            ${_generator_override_args}
+             ${_generator_args}
+             -S ${CMAKE_SOURCE_DIR}/llama/server
+             --preset ${ARG_PRESET}
+@@ -672,6 +703,34 @@ if(OLLAMA_HAVE_LLAMA_SERVER)
+                 TARGETS ggml-hip
+                 CMAKE_ARGS ${_rocm_args})
+             list(APPEND _backend_targets ollama-llama-server-${_backend})
++        elseif(_backend STREQUAL "sycl")
++            # Intel oneAPI SYCL backend. The DPC++/C++ compiler (icx) drives a
++            # Ninja sub-build, mirroring llama.cpp's official Windows SYCL
++            # instructions. Requires the Intel oneAPI environment (setvars.bat)
++            # to be active during configuration. GGML_SYCL_F16 defaults to ON
++            # for better long-prompt performance and can be overridden from the
++            # superbuild cache (e.g. -DGGML_SYCL_F16=OFF).
++            set(_sycl_args
++                -DBUILD_SHARED_LIBS=ON
++                -DGGML_BACKEND_DL=ON
++                -DGGML_SYCL=ON
++                -DOLLAMA_GPU_BACKEND=sycl)
++            if(NOT DEFINED GGML_SYCL_F16)
++                list(APPEND _sycl_args -DGGML_SYCL_F16=ON)
++            endif()
++            if(WIN32)
++                # C code (ggml core, llama, server) is compiled with MSVC's cl;
++                # only the SYCL device code needs the DPC++ compiler.
++                list(APPEND _sycl_args
++                    -DCMAKE_C_COMPILER=cl
++                    -DCMAKE_CXX_COMPILER=icx)
++            endif()
++            ollama_add_llama_server_build(sycl
++                GENERATOR Ninja
++                RUNNER_DIR sycl
++                TARGETS ggml-sycl
++                CMAKE_ARGS ${_sycl_args})
++            list(APPEND _backend_targets ollama-llama-server-${_backend})
+         elseif(_backend STREQUAL "vulkan")
+             ollama_add_llama_server_build(vulkan
+                 RUNNER_DIR vulkan
+diff --git a/discover/llama_server.go b/discover/llama_server.go
+index a66c34e..18a31bc 100644
+--- a/discover/llama_server.go
++++ b/discover/llama_server.go
+@@ -476,6 +476,8 @@ func inferLibrary(name, description string) string {
+ 		return "Metal"
+ 	case strings.Contains(combined, "vulkan"):
+ 		return "Vulkan"
++	case strings.Contains(combined, "sycl"):
++		return "SYCL"
+ 	default:
+ 		return description
+ 	}
+diff --git a/discover/runner.go b/discover/runner.go
+index 2c533c3..ed417e3 100644
+--- a/discover/runner.go
++++ b/discover/runner.go
+@@ -625,6 +625,8 @@ func visibleDeviceFilterTokens(goos, library string) []string {
+ 		}
+ 	case "Vulkan":
+ 		return splitVisibleDeviceList(envconfig.VkVisibleDevices())
++	case "SYCL":
++		return splitSyclVisibleDeviceList(envconfig.OneapiDeviceSelector())
+ 	}
+ 
+ 	return nil
+@@ -676,6 +678,28 @@ func splitNumericVisibleDeviceList(value string) []string {
+ 	return tokens
+ }
+ 
++// splitSyclVisibleDeviceList parses ONEAPI_DEVICE_SELECTOR values like
++// "level_zero:0;level_zero:1" (or bare numeric IDs) into device ordinals.
++func splitSyclVisibleDeviceList(value string) []string {
++	var tokens []string
++	for _, field := range strings.Split(value, ";") {
++		field = strings.TrimSpace(field)
++		if field == "" {
++			continue
++		}
++		if _, _, ok := strings.Cut(field, ":"); ok {
++			// Accept "<backend>:<id>" (e.g. "level_zero:0") and use the id.
++			field = field[strings.LastIndex(field, ":")+1:]
++		}
++		index, err := strconv.Atoi(field)
++		if err != nil || index < 0 {
++			return nil
++		}
++		tokens = append(tokens, strconv.Itoa(index))
++	}
++	return tokens
++}
++
+ func visibleDeviceOrdinals(count int) string {
+ 	ordinals := make([]string, count)
+ 	for i := range ordinals {
+@@ -714,6 +738,7 @@ func overrideWarnings() {
+ 		"HIP_VISIBLE_DEVICES",
+ 		"ROCR_VISIBLE_DEVICES",
+ 		"GGML_VK_VISIBLE_DEVICES",
++		"ONEAPI_DEVICE_SELECTOR",
+ 		"GPU_DEVICE_ORDINAL",
+ 		"HSA_OVERRIDE_GFX_VERSION",
+ 	} {
+diff --git a/envconfig/config.go b/envconfig/config.go
+index 61a2c7c..d36f645 100644
+--- a/envconfig/config.go
++++ b/envconfig/config.go
+@@ -252,6 +252,7 @@ var (
+ 	HipVisibleDevices     = String("HIP_VISIBLE_DEVICES")
+ 	RocrVisibleDevices    = String("ROCR_VISIBLE_DEVICES")
+ 	VkVisibleDevices      = String("GGML_VK_VISIBLE_DEVICES")
++	OneapiDeviceSelector  = String("ONEAPI_DEVICE_SELECTOR")
+ 	GpuDeviceOrdinal      = String("GPU_DEVICE_ORDINAL")
+ 	HsaOverrideGfxVersion = String("HSA_OVERRIDE_GFX_VERSION")
+ )
+@@ -355,6 +356,7 @@ func AsMap() map[string]EnvVar {
+ 		ret["HIP_VISIBLE_DEVICES"] = EnvVar{"HIP_VISIBLE_DEVICES", HipVisibleDevices(), "Set which AMD devices are visible by numeric ID"}
+ 		ret["ROCR_VISIBLE_DEVICES"] = EnvVar{"ROCR_VISIBLE_DEVICES", RocrVisibleDevices(), "Set which AMD devices are visible by UUID or numeric ID"}
+ 		ret["GGML_VK_VISIBLE_DEVICES"] = EnvVar{"GGML_VK_VISIBLE_DEVICES", VkVisibleDevices(), "Set which Vulkan devices are visible by numeric ID"}
++		ret["ONEAPI_DEVICE_SELECTOR"] = EnvVar{"ONEAPI_DEVICE_SELECTOR", OneapiDeviceSelector(), "Set which Intel oneAPI (SYCL) devices are visible, e.g. level_zero:0"}
+ 		ret["GPU_DEVICE_ORDINAL"] = EnvVar{"GPU_DEVICE_ORDINAL", GpuDeviceOrdinal(), "Set which AMD devices are visible by numeric ID"}
+ 		ret["HSA_OVERRIDE_GFX_VERSION"] = EnvVar{"HSA_OVERRIDE_GFX_VERSION", HsaOverrideGfxVersion(), "Override the gfx used for all detected AMD GPUs"}
+ 		ret["OLLAMA_VULKAN"] = EnvVar{"OLLAMA_VULKAN", EnableVulkan(true), "Enable Vulkan support"}
+diff --git a/llama/server/CMakeLists.txt b/llama/server/CMakeLists.txt
+index 7d88fcd..56d3491 100644
+--- a/llama/server/CMakeLists.txt
++++ b/llama/server/CMakeLists.txt
+@@ -518,6 +518,49 @@ if(OLLAMA_RUNNER_DIR)
+             )
+         endif()
+     endif()
++    if(GGML_SYCL)
++        # ggml-sycl depends on the Intel oneAPI SYCL runtime (sycl*.dll,
++        # oneDNN, oneMKL, Level Zero adapters, ...). Bundle them next to the
++        # backend so the packaged runner is self-contained and does not require
++        # a host-wide oneAPI installation, mirroring llama.cpp's official
++        # Windows SYCL release zips. ONEAPI_ROOT must point at the oneAPI
++        # installation when configuring/building this backend.
++        file(TO_CMAKE_PATH "$ENV{ONEAPI_ROOT}" _ollama_oneapi_root)
++        install(CODE "
++            set(_sycl_dest \"\${CMAKE_INSTALL_PREFIX}/${_base_dest}/${OLLAMA_RUNNER_DIR}\")
++            set(_oneapi_root \"${_ollama_oneapi_root}\")
++            if(NOT _oneapi_root)
++                message(WARNING \"ONEAPI_ROOT not set; skipping oneAPI SYCL runtime bundling\")
++            else()
++                foreach(_rel
++                        mkl/latest/bin/mkl_sycl_blas.5.dll
++                        mkl/latest/bin/mkl_core.2.dll
++                        mkl/latest/bin/mkl_tbb_thread.2.dll
++                        dnnl/latest/bin/dnnl.dll
++                        tbb/latest/bin/tbb12.dll
++                        tcm/latest/bin/tcm.dll
++                        tcm/latest/bin/libhwloc-15.dll
++                        umf/latest/bin/umf.dll
++                        compiler/latest/bin/svml_dispmd.dll
++                        compiler/latest/bin/libmmd.dll
++                        compiler/latest/bin/libiomp5md.dll
++                        compiler/latest/bin/libsycl-fallback-bfloat16.spv
++                        compiler/latest/bin/libsycl-native-bfloat16.spv)
++                    if(EXISTS \"\${_oneapi_root}/\${_rel}\")
++                        file(INSTALL \"\${_oneapi_root}/\${_rel}\" DESTINATION \"\${_sycl_dest}\")
++                    endif()
++                endforeach()
++                file(GLOB _sycl_runtime_dlls
++                    \"\${_oneapi_root}/compiler/latest/bin/sycl*.dll\"
++                    \"\${_oneapi_root}/compiler/latest/bin/ur_*.dll\"
++                    \"\${_oneapi_root}/compiler/latest/bin/ze_loader.dll\"
++                    \"\${_oneapi_root}/level_zero/latest/bin/ze_loader.dll\")
++                foreach(_dll \${_sycl_runtime_dlls})
++                    file(INSTALL \"\${_dll}\" DESTINATION \"\${_sycl_dest}\")
++                endforeach()
++            endif()
++        " COMPONENT llama-server)
++    endif()
+ else()
+     # CPU/base build — install llama-server, llama-quantize + all shared libs + CPU backend modules
+     # RUNTIME covers executables and Windows DLLs; LIBRARY covers .so on Linux
+diff --git a/ml/device.go b/ml/device.go
+index fbeb071..59d1c16 100644
+--- a/ml/device.go
++++ b/ml/device.go
+@@ -682,12 +682,18 @@ func (d DeviceInfo) PreferredLibrary(other DeviceInfo) bool {
+ 	if d.Library == "CUDA" || d.Library == "ROCm" {
+ 		return true
+ 	}
++	// Prefer SYCL over Vulkan on Intel GPUs when both backends are installed.
++	if d.Library == "SYCL" && other.Library == "Vulkan" {
++		return true
++	}
+ 	return false
+ }
+ 
+ func (d DeviceInfo) updateVisibleDevicesEnv(env map[string]string, mustFilter bool) {
+ 	var envVar string
+ 	var rocmOrdinalEnv string
++	sep := ","
++	valuePrefix := ""
+ 	switch d.Library {
+ 	case "ROCm":
+ 		// ROCm must be filtered as it can crash the runner on unsupported devices
+@@ -709,13 +715,25 @@ func (d DeviceInfo) updateVisibleDevicesEnv(env map[string]string, mustFilter bo
+ 			return
+ 		}
+ 		envVar = "GGML_VK_VISIBLE_DEVICES"
++	case "SYCL":
++		// SYCL selects devices through ONEAPI_DEVICE_SELECTOR
++		// (e.g. "level_zero:0;level_zero:1").
++		if !mustFilter {
++			return
++		}
++		envVar = "ONEAPI_DEVICE_SELECTOR"
++		sep = ";"
++		valuePrefix = "level_zero:"
+ 	default:
+ 		return
+ 	}
+ 	v, existing := env[envVar]
+ 	childOrdinal := visibleDeviceCount(v)
+ 	if existing {
+-		v = v + ","
++		v = v + sep
++	}
++	if valuePrefix != "" {
++		v = v + valuePrefix
+ 	}
+ 	if d.FilterID != "" {
+ 		v = v + d.FilterID
