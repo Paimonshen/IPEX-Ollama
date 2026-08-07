@@ -78,6 +78,10 @@ build.bat package
 
 等价于 `configure` → `build` → 组装成品到 `..\IPEX-Ollama\`，之后可按提示打包为 `IPEX-Ollama.zip`。
 
+## GitHub Actions 云编译
+
+仓库内置 `.github/workflows/build.yml`：推送到 `main` 时自动在 GitHub 服务器上静默安装 Intel oneAPI（仅 DPC++ 编译器 / oneMKL / oneDNN / oneTBB 组件，与 llama.cpp 官方 CI 一致）并编译打包；推送 `v*` 标签时自动发布 Release，`IPEX-Ollama.zip` 直接挂在附件。首次云端构建约需 30–60 分钟（含 oneAPI 安装），本地 `build.bat` 仍可用于离线构建。
+
 ### 对上游的改动
 
 `Source` 的 `main` 分支包含 4 个提交（`codex/sycl` 分支为开发分支）：
