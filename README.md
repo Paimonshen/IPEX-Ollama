@@ -106,6 +106,16 @@ update_upstream.bat
 git apply ollama-sycl.patch
 ```
 
+### 云端全自动同步（推荐）
+
+仓库内置 `sync-upstream` workflow：每周一自动把上游 main 合并进 `sync/upstream` 分支并开 PR，PR 的 Windows 构建通过后自动合入 `main`（也可在 Actions 页手动触发）。启用自动合入需一次性设置：
+
+1. 仓库 Settings → General → Pull Requests → 勾选 **Allow auto-merge**
+2. 仓库 Settings → Branches → 为 `main` 添加规则 → 勾选 **Require status checks to pass before merging** → 添加构建检查 `Build Windows (SYCL / Intel oneAPI)`
+3. Actions 页 → **Sync upstream** → **Run workflow** 跑一次
+
+之后打 `v*` 标签即自动云编译并发布 Release（版本号自动取上游最新标签）。若同步 PR 出现冲突（上游改了 SYCL 相关文件），自动合并会暂停，`main` 不受影响，可在 PR 页面手动解决或用上面的 `update_upstream.bat` 处理。
+
 ## 致谢
 
 - [ollama/ollama](https://github.com/ollama/ollama) — 上游项目

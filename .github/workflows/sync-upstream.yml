@@ -1,0 +1,77 @@
+name: sync-upstream
+
+# Weekly automatic merge of the latest ollama/ollama main into this repo.
+# Creates/updates a `sync/upstream` branch, opens a pull request back to main,
+# and (if auto-merge is enabled) merges it once the Windows build passes.
+#
+# Run it manually any time from Actions -> Sync upstream -> Run workflow.
+
+on:
+  schedule:
+    - cron: "0 0 * * 1"   # every Monday 00:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Disable upstream workflows that need org secrets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for wf in latest.yaml release.yaml; do
+            if gh workflow disable "$wf" 2>/dev/null; then
+              echo "Disabled upstream workflow: $wf"
+            else
+              echo "Could not disable $wf; if it appears in the Actions tab, disable it manually."
+            fi
+          done
+
+      - name: Fetch and merge upstream
+        run: |
+          git remote add upstream https://github.com/ollama/ollama.git
+          git fetch upstream main
+          git checkout -B sync/upstream origin/main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "No new upstream commits since the last sync."
+            exit 0
+          fi
+          git merge --no-edit upstream/main
+          # This repo rewrites README.md as its own project page; keep that version.
+          git checkout sync/upstream -- README.md
+          git add README.md
+          git commit --amend --no-edit
+
+      - name: Push sync branch
+        run: git push --force-with-lease origin sync/upstream
+
+      - name: Open or update pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --base main --head sync/upstream \
+            --title "chore: sync upstream ollama/ollama" \
+            --body "Automatically merged the latest [ollama/ollama](https://github.com/ollama/ollama) main into this branch. The Windows build runs on this PR; if auto-merge is enabled it merges when the required check passes." \
+            || true
+
+      - name: Enable auto-merge on the PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr merge sync/upstream --auto --merge || \
+            echo "Auto-merge is not enabled for this repo; review and merge the PR manually."
