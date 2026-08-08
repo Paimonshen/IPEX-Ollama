@@ -37,19 +37,33 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Install Intel oneAPI Base Toolkit (Windows)
+      - name: Install Intel oneAPI (Windows)
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/076e961b-2c29-48a8-9203-c96f00e7051b/intel-oneapi-base-toolkit-2025.3.1.35_offline.exe"
-          Invoke-WebRequest -Uri $url -OutFile oneapi.exe
-          # Full silent install using Intel's documented command for 2025.3.1.
-          & .\oneapi.exe -a --silent --eula accept
+          $ErrorActionPreference = 'Stop'
+          $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/b60765d1-2b85-4e85-86b6-cb0e9563a699/intel-deep-learning-essentials-2025.3.3.18_offline.exe"
+          $components = "intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.mkl.devel:intel.oneapi.win.dnnl:intel.oneapi.win.tbb.devel"
+          Write-Output "Downloading oneAPI (deep learning essentials)..."
+          curl.exe -L --output oneapi.exe --url $url --retry 5 --retry-delay 5
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Output "Extracting installer..."
+          & .\oneapi.exe -s -x -f webimage_extracted --log extract.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Output "Installing DPC++/MKL/DNNL/TBB components..."
+          & .\webimage_extracted\bootstrapper.exe -s --action install --components=$components --eula=accept -p=NEED_VS2017_INTEGRATION=0 -p=NEED_VS2019_INTEGRATION=0 -p=NEED_VS2022_INTEGRATION=0 --log-dir=.
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The installer may finalize asynchronously; poll until icx.exe appears.
+          $icx = $null
+          for ($i = 0; $i -lt 60; $i++) {
+            $icx = Get-ChildItem "C:\Program Files*\Intel\oneAPI" -Filter icx.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($icx) { break }
+            Start-Sleep -Seconds 10
+          }
           $sv = Get-ChildItem "C:\Program Files*\Intel\oneAPI" -Filter setvars.bat -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          $icx = Get-ChildItem "C:\Program Files*\Intel\oneAPI" -Filter icx.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $sv -or -not $icx) {
+          if (-not $icx -or -not $sv) {
             Write-Error "oneAPI install incomplete: setvars.bat=$($null -ne $sv), icx.exe=$($null -ne $icx)"
+            Get-Content extract.log -ErrorAction SilentlyContinue
             exit 1
           }
           $root = Split-Path -Parent $sv.FullName
