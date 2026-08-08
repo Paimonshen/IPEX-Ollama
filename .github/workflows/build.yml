@@ -1,4 +1,4 @@
-name: Build Windows (SYCL / Intel oneAPI)
+﻿name: Build Windows (SYCL / Intel oneAPI)
 
 on:
   workflow_dispatch:
@@ -41,22 +41,32 @@ jobs:
           # Colons are the separator the Intel installer expects.
           $components = "intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.mkl.devel:intel.oneapi.win.dnnl:intel.oneapi.win.tbb.devel"
           & .\oneapi.exe -s --action install --components $components --eula accept
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Component install failed, falling back to full Base Toolkit install"
+          $code = $LASTEXITCODE
+          $sv = Get-ChildItem "C:\Program Files*\Intel\oneAPI" -Filter setvars.bat -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($code -ne 0 -or -not $sv) {
+            Write-Warning "Component install incomplete (exit=$code, setvars.bat missing); installing the full Base Toolkit"
             & .\oneapi.exe -s --action install --eula accept
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $sv = Get-ChildItem "C:\Program Files*\Intel\oneAPI" -Filter setvars.bat -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           }
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not $sv) {
+            Write-Error "oneAPI installed but setvars.bat was not found"
+            exit 1
+          }
+          $root = Split-Path -Parent $sv.FullName
+          "ONEAPI_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8
+          Write-Output "Using oneAPI at $root"
 
       - name: Configure
         shell: cmd
         run: |
-          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force >nul
+          call "%ONEAPI_ROOT%\setvars.bat" intel64 --force >nul
           cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DOLLAMA_LLAMA_BACKENDS=sycl -DOLLAMA_VERSION=%OLLAMA_VERSION% -DCMAKE_BUILD_TYPE=Release -DGGML_CCACHE=OFF
 
       - name: Build
         shell: cmd
         run: |
-          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force >nul
+          call "%ONEAPI_ROOT%\setvars.bat" intel64 --force >nul
           cmake --build build --config Release --parallel 2
 
       - name: Assemble package
