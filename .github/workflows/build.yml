@@ -37,25 +37,20 @@ jobs:
         run: |
           $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/076e961b-2c29-48a8-9203-c96f00e7051b/intel-oneapi-base-toolkit-2025.3.1.35_offline.exe"
           Invoke-WebRequest -Uri $url -OutFile oneapi.exe
-          # Same component set used by llama.cpp's official Windows SYCL CI.
-          # Colons are the separator the Intel installer expects.
-          $components = "intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.mkl.devel:intel.oneapi.win.dnnl:intel.oneapi.win.tbb.devel"
-          & .\oneapi.exe -s --action install --components $components --eula accept
-          $code = $LASTEXITCODE
+          # Full silent install using Intel's documented command for 2025.3.1.
+          # Component-selective installs are unreliable across versions (they can
+          # exit 0 without installing the DPC++ compiler), so install everything.
+          & .\oneapi.exe -a --silent --eula accept
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $sv = Get-ChildItem "C:\Program Files*\Intel\oneAPI" -Filter setvars.bat -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($code -ne 0 -or -not $sv) {
-            Write-Warning "Component install incomplete (exit=$code, setvars.bat missing); installing the full Base Toolkit"
-            & .\oneapi.exe -s --action install --eula accept
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            $sv = Get-ChildItem "C:\Program Files*\Intel\oneAPI" -Filter setvars.bat -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          }
-          if (-not $sv) {
-            Write-Error "oneAPI installed but setvars.bat was not found"
+          $icx = Get-ChildItem "C:\Program Files*\Intel\oneAPI" -Filter icx.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $sv -or -not $icx) {
+            Write-Error "oneAPI install incomplete: setvars.bat=$($null -ne $sv), icx.exe=$($null -ne $icx)"
             exit 1
           }
           $root = Split-Path -Parent $sv.FullName
           "ONEAPI_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8
-          Write-Output "Using oneAPI at $root"
+          Write-Output "Using oneAPI at $root (icx: $($icx.FullName))"
 
       - name: Configure
         shell: cmd
