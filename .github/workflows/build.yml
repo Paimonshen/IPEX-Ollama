@@ -48,11 +48,34 @@ jobs:
           curl.exe -L --output oneapi.exe --url $url --retry 5 --retry-delay 5
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Write-Output "Extracting installer..."
-          & .\oneapi.exe -s -x -f webimage_extracted --log extract.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $extract = Start-Process -FilePath ".\oneapi.exe" -ArgumentList @('-s','-x','-f','webimage_extracted','--log','extract.log') -Wait -PassThru
+          if ($extract.ExitCode -ne 0) {
+            Get-Content extract.log -ErrorAction SilentlyContinue
+            exit $extract.ExitCode
+          }
+          # The SFX may finalize asynchronously; poll until bootstrapper.exe appears.
+          $bs = $null
+          for ($i = 0; $i -lt 36; $i++) {
+            $bs = Get-Item ".\webimage_extracted\bootstrapper.exe" -ErrorAction SilentlyContinue
+            if ($bs) { break }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $bs) {
+            Write-Error "Extraction produced no bootstrapper.exe. Workspace contents:"
+            Get-ChildItem -Force -ErrorAction SilentlyContinue | Select-Object Name, Length | Format-Table -AutoSize
+            if (Test-Path ".\webimage_extracted") {
+              Write-Output "webimage_extracted contents:"
+              Get-ChildItem ".\webimage_extracted" -Force -Recurse -ErrorAction SilentlyContinue | Select-Object -First 30 FullName
+            }
+            Get-Content extract.log -ErrorAction SilentlyContinue
+            exit 1
+          }
           Write-Output "Installing DPC++/MKL/DNNL/TBB components..."
-          & .\webimage_extracted\bootstrapper.exe -s --action install --components=$components --eula=accept -p=NEED_VS2017_INTEGRATION=0 -p=NEED_VS2019_INTEGRATION=0 -p=NEED_VS2022_INTEGRATION=0 --log-dir=.
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $install = Start-Process -FilePath ".\webimage_extracted\bootstrapper.exe" -ArgumentList @('-s','--action','install',"--components=$components",'--eula=accept','-p=NEED_VS2017_INTEGRATION=0','-p=NEED_VS2019_INTEGRATION=0','-p=NEED_VS2022_INTEGRATION=0','--log-dir=.') -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            Get-ChildItem ".\webimage_extracted" -Filter *.log -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -ErrorAction SilentlyContinue }
+            exit $install.ExitCode
+          }
           # The installer may finalize asynchronously; poll until icx.exe appears.
           $icx = $null
           for ($i = 0; $i -lt 60; $i++) {
