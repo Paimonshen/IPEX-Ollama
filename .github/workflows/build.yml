@@ -1,16 +1,20 @@
-﻿name: Build Windows (SYCL / Intel oneAPI)
+name: Build Windows (SYCL / Intel oneAPI)
 
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, codex/sycl-upstream]
     tags: ["v*"]
   pull_request:
     branches: [main]
 
 jobs:
   build:
-    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
     env:
       OLLAMA_VERSION: 0.32.6
     steps:
@@ -30,16 +34,16 @@ jobs:
           echo "OLLAMA_VERSION=${VER#v}" >> "$GITHUB_ENV"
 
       - name: Setup MSVC (cl)
+        if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Install Intel oneAPI Base Toolkit
+      - name: Install Intel oneAPI Base Toolkit (Windows)
+        if: runner.os == 'Windows'
         shell: powershell
         run: |
           $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/076e961b-2c29-48a8-9203-c96f00e7051b/intel-oneapi-base-toolkit-2025.3.1.35_offline.exe"
           Invoke-WebRequest -Uri $url -OutFile oneapi.exe
           # Full silent install using Intel's documented command for 2025.3.1.
-          # Component-selective installs are unreliable across versions (they can
-          # exit 0 without installing the DPC++ compiler), so install everything.
           & .\oneapi.exe -a --silent --eula accept
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $sv = Get-ChildItem "C:\Program Files*\Intel\oneAPI" -Filter setvars.bat -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -49,12 +53,24 @@ jobs:
             exit 1
           }
           $root = Split-Path -Parent $sv.FullName
-          # Append to GITHUB_ENV without a BOM (PowerShell 5.1 Out-File would add
-          # one and corrupt the variable name) and without overwriting earlier lines.
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "ONEAPI_ROOT=$root`n", (New-Object System.Text.UTF8Encoding($false)))
           Write-Output "Using oneAPI at $root (icx: $($icx.FullName))"
 
-      - name: Configure
+      - name: Install Intel oneAPI (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | sudo gpg --dearmor --yes -o /usr/share/keyrings/oneapi-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          sudo apt-get update
+          sudo apt-get install -y intel-oneapi-compiler-dpcpp-cpp intel-oneapi-mkl-devel intel-oneapi-dnnl-devel intel-oneapi-tbb-devel
+          test -f /opt/intel/oneapi/setvars.sh
+          ls /opt/intel/oneapi/compiler/latest/bin/icx
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
         shell: cmd
         run: |
           if "%ONEAPI_ROOT%"=="" (
@@ -65,7 +81,15 @@ jobs:
           call "%ONEAPI_ROOT%\setvars.bat" intel64 --force >nul
           cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DOLLAMA_LLAMA_BACKENDS=sycl -DOLLAMA_VERSION=%OLLAMA_VERSION% -DCMAKE_BUILD_TYPE=Release -DGGML_CCACHE=OFF
 
-      - name: Build
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1
+          cmake -S . -B build -G Ninja -DOLLAMA_LLAMA_BACKENDS=sycl -DOLLAMA_VERSION=$OLLAMA_VERSION -DCMAKE_BUILD_TYPE=Release -DGGML_CCACHE=OFF
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
         shell: cmd
         run: |
           if "%ONEAPI_ROOT%"=="" (
@@ -75,7 +99,20 @@ jobs:
           call "%ONEAPI_ROOT%\setvars.bat" intel64 --force >nul
           cmake --build build --config Release --parallel 2
 
-      - name: Assemble package
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1
+          cmake --build build --config Release --parallel 2
+
+      - name: Unit tests (discover + ml)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: go test ./discover/... ./ml/...
+
+      - name: Assemble package (Windows)
+        if: runner.os == 'Windows'
         shell: powershell
         run: |
           $out = "release\IPEX-Ollama"
@@ -83,15 +120,40 @@ jobs:
           Copy-Item ollama.exe $out\
           Copy-Item build\lib\ollama "$out\lib\ollama" -Recurse -Force
           Set-Content -Path "$out\start-ollama.bat" -Value "@echo off`r`ncd /d `"%~dp0`"`r`nollama serve`r`n" -Encoding ascii
-          Compress-Archive -Path $out -DestinationPath release\IPEX-Ollama.zip -Force
+          Compress-Archive -Path $out -DestinationPath release\IPEX-Ollama-win64.zip -Force
+
+      - name: Assemble package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          out=release/IPEX-Ollama
+          mkdir -p "$out"
+          cp ollama "$out/"
+          cp -r build/lib/ollama "$out/lib/"
+          printf '#!/bin/sh\ncd "$(dirname "$0")"\n./ollama serve\n' > "$out/start-ollama.sh"
+          chmod +x "$out/start-ollama.sh"
+          tar -czf release/IPEX-Ollama-linux-x64.tar.gz -C release IPEX-Ollama
 
       - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
         with:
-          name: IPEX-Ollama
-          path: release/IPEX-Ollama.zip
+          name: IPEX-Ollama-win64
+          path: release/IPEX-Ollama-win64.zip
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: IPEX-Ollama-linux-x64
+          path: release/IPEX-Ollama-linux-x64.tar.gz
 
       - name: Publish GitHub Release (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'Windows'
         uses: softprops/action-gh-release@v2
         with:
-          files: release/IPEX-Ollama.zip
+          files: release/IPEX-Ollama-win64.zip
+
+      - name: Publish GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'Linux'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/IPEX-Ollama-linux-x64.tar.gz
