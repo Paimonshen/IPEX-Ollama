@@ -49,18 +49,29 @@ jobs:
             exit 1
           }
           $root = Split-Path -Parent $sv.FullName
-          "ONEAPI_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8
+          # Append to GITHUB_ENV without a BOM (PowerShell 5.1 Out-File would add
+          # one and corrupt the variable name) and without overwriting earlier lines.
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "ONEAPI_ROOT=$root`n", (New-Object System.Text.UTF8Encoding($false)))
           Write-Output "Using oneAPI at $root (icx: $($icx.FullName))"
 
       - name: Configure
         shell: cmd
         run: |
+          if "%ONEAPI_ROOT%"=="" (
+            echo [ERROR] ONEAPI_ROOT is empty - the oneAPI install step did not export it.
+            exit /b 1
+          )
+          echo ONEAPI_ROOT=%ONEAPI_ROOT%
           call "%ONEAPI_ROOT%\setvars.bat" intel64 --force >nul
           cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DOLLAMA_LLAMA_BACKENDS=sycl -DOLLAMA_VERSION=%OLLAMA_VERSION% -DCMAKE_BUILD_TYPE=Release -DGGML_CCACHE=OFF
 
       - name: Build
         shell: cmd
         run: |
+          if "%ONEAPI_ROOT%"=="" (
+            echo [ERROR] ONEAPI_ROOT is empty - the oneAPI install step did not export it.
+            exit /b 1
+          )
           call "%ONEAPI_ROOT%\setvars.bat" intel64 --force >nul
           cmake --build build --config Release --parallel 2
 
