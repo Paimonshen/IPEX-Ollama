@@ -27,7 +27,8 @@ func init() {
 var (
 	_ base.Model      = (*Model)(nil)
 	_ base.SelfDraft  = (*Model)(nil)
-	_ base.DraftModel = (*Model)(nil)
+	_ base.DraftModel = (*mtpDraft)(nil)
+	_ base.MediaModel = (*Model)(nil)
 )
 
 // RopeParameters carries optional rope metadata embedded under rope_parameters.
@@ -36,6 +37,7 @@ type RopeParameters struct {
 	RopeType            string  `json:"rope_type"`
 	RopeTheta           float32 `json:"rope_theta"`
 	PartialRotaryFactor float32 `json:"partial_rotary_factor"`
+	MropeSection        []int32 `json:"mrope_section"`
 }
 
 // Config holds Qwen 3.5 text config (top-level or nested text_config).
@@ -76,6 +78,8 @@ type Config struct {
 	RopeScaling         map[string]any  `json:"rope_scaling"`
 	RopeParameters      *RopeParameters `json:"rope_parameters"`
 
+	MropeSection []int32 `json:"-"`
+
 	// Quantization metadata.
 	QuantGroupSize int                               `json:"-"`
 	QuantBits      int                               `json:"-"`
@@ -96,14 +100,19 @@ type Model struct {
 
 	MTP *MTPHead
 
+	// Vision components; nil for text-only checkpoints.
+	Vision      *VisionConfig
+	VisionTower *VisionTower
+	MM          multimodalConfig
+
 	tok *tokenizer.Tokenizer
 	*Config
 
 	weightPrefix string
 }
 
-// MTPHead is the multi-token-prediction draft head; it owns a KV cache appended
-// after the per-layer caches and reuses the model's lm_head.
+// MTPHead is the multi-token-prediction draft head; it writes one KV cache
+// and reuses the model's lm_head.
 type MTPHead struct {
 	Enorm *nn.RMSNorm
 	Hnorm *nn.RMSNorm
@@ -276,6 +285,10 @@ func parseConfig(configData []byte) (Config, error) {
 		ropeDim = cfg.HeadDim
 	}
 	cfg.RopeDim = ropeDim
+	cfg.MropeSection = []int32{11, 11, 10}
+	if cfg.RopeParameters != nil && len(cfg.RopeParameters.MropeSection) == 3 {
+		cfg.MropeSection = cfg.RopeParameters.MropeSection
+	}
 
 	if cfg.FullAttentionInterval <= 0 {
 		for i, lt := range cfg.LayerTypes {
@@ -405,9 +418,16 @@ func NewModel(root *model.Root) (base.Model, error) {
 		return nil, fmt.Errorf("parse tokenizer: %w", err)
 	}
 
+	mm, err := parseMultimodalConfig(configData)
+	if err != nil {
+		return nil, err
+	}
+
 	m := &Model{
 		Layers: make([]*Layer, cfg.NumHiddenLayers),
 		Config: &cfg,
+		MM:     mm,
+		Vision: mm.VisionConfig,
 		tok:    tok,
 	}
 
@@ -870,7 +890,7 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		}
 	}
 
-	return nil
+	return m.loadVisionWeights(tensors, linears)
 }
 
 // loadLayer builds a decoder layer from tensors at layerPrefix. It serves both
@@ -1021,7 +1041,7 @@ func (m *Model) loadMTPHead(linears model.LinearFactory, tensors map[string]*mlx
 	return nil
 }
 
-func (a *FullAttention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *mlx.Array, B, L int32, cfg *Config) *mlx.Array {
+func (a *FullAttention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *mlx.Array, B, L int32, cfg *Config, mropeCos, mropeSin *mlx.Array) *mlx.Array {
 	qg := a.QProj.Forward(x)
 	qg = mlx.Reshape(qg, B, L, cfg.NumAttentionHeads, cfg.HeadDim*2)
 	q := mlx.SliceStartStop(qg, []int32{0, 0, 0, 0}, []int32{B, L, cfg.NumAttentionHeads, cfg.HeadDim})
@@ -1040,8 +1060,13 @@ func (a *FullAttention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, pos
 	k = mlx.Transpose(k, 0, 2, 1, 3)
 	v = mlx.Transpose(v, 0, 2, 1, 3)
 
-	q = mlx.RoPEWithBase(q, int(cfg.RopeDim), false, cfg.RopeTheta, 1.0, positions)
-	k = mlx.RoPEWithBase(k, int(cfg.RopeDim), false, cfg.RopeTheta, 1.0, positions)
+	if mropeCos != nil {
+		q = applyMRoPE(q, mropeCos, mropeSin, cfg.RopeDim)
+		k = applyMRoPE(k, mropeCos, mropeSin, cfg.RopeDim)
+	} else {
+		q = mlx.RoPEWithBase(q, int(cfg.RopeDim), false, cfg.RopeTheta, 1.0, positions)
+		k = mlx.RoPEWithBase(k, int(cfg.RopeDim), false, cfg.RopeTheta, 1.0, positions)
+	}
 
 	var kv nn.SDPAOption
 	if c != nil {
@@ -1181,71 +1206,100 @@ func (m *SparseMoE) Forward(x *mlx.Array, cfg *Config) *mlx.Array {
 	return mlx.Reshape(y, B, L, cfg.HiddenSize)
 }
 
-func (l *Layer) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *mlx.Array, B, L int32, cfg *Config) *mlx.Array {
+func (l *Layer) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *mlx.Array, B, L int32, cfg *Config, mropeCos, mropeSin *mlx.Array) *mlx.Array {
 	var r *mlx.Array
 	normed := l.InputNorm.Forward(x, cfg.RMSNormEps)
 	if l.IsLinear {
 		r = l.Linear.Forward(normed, b, c, B, L, cfg)
 	} else {
-		r = l.FullAttn.Forward(normed, b, c, positions, B, L, cfg)
+		r = l.FullAttn.Forward(normed, b, c, positions, B, L, cfg, mropeCos, mropeSin)
 	}
 	h := mlx.Add(x, r)
 	r = l.MLP.Forward(l.PostAttentionNorm.Forward(h, cfg.RMSNormEps), cfg)
 	return mlx.Add(h, r)
 }
 
-func (m *Model) Forward(b *batch.Batch, caches []cache.Cache) *mlx.Array {
+func (m *Model) Forward(b *batch.Batch, caches []cache.Cache) (hidden, auxHidden *mlx.Array) {
 	dims := b.InputIDs.Dims()
 	B, L := int32(dims[0]), int32(dims[1])
 	positions := mlx.FromValues(b.SeqOffsets, len(b.SeqOffsets))
 
 	h := m.EmbedTokens.Forward(b.InputIDs)
+	if len(b.Media) > 0 {
+		h = m.scatterMedia(h, b, 0)
+	}
+
+	// One shared table pair per forward: every full-attention layer applies
+	// the same chunk positions.
+	var mropeCos, mropeSin *mlx.Array
+	if mp := ropePositions(b, L); mp != nil {
+		mropeCos, mropeSin = mropeCosSin(m.Config, mp, L)
+	}
+
 	for i, layer := range m.Layers {
 		var c cache.Cache
 		if caches != nil && i < len(caches) {
 			c = caches[i]
 		}
-		h = layer.Forward(h, b, c, positions, B, L, m.Config)
+		h = layer.Forward(h, b, c, positions, B, L, m.Config, mropeCos, mropeSin)
 	}
 	out := m.Norm.Forward(h, m.RMSNormEps)
-	return out
+	return out, out
 }
 
 func (m *Model) Unembed(x *mlx.Array) *mlx.Array {
 	return m.LMHead.Forward(x)
 }
 
-// DraftCaches returns the MTP head's KV caches: the trailing slots NewCaches
-// appended after the per-layer caches.
-func (m *Model) DraftCaches(caches []cache.Cache) []cache.Cache {
+// mtpDraft is the model viewed as its own draft: the same struct, carrying
+// the DraftModel method set for the inline MTP head.
+type mtpDraft Model
+
+// NewCaches builds the MTP head's KV cache.
+func (m *mtpDraft) NewCaches() []cache.Cache {
 	if m.MTP == nil {
 		return nil
 	}
-	return caches[len(m.Layers):]
+	return []cache.Cache{cache.NewKVCache()}
 }
 
-// SelfDraft returns the model as its own draft when an MTP head loaded, else
-// nil; Draft exists either way, so availability is reported here.
+// LoadWeights does nothing: an inline head's weights load with the target's.
+func (m *mtpDraft) LoadWeights(map[string]*mlx.Array) error { return nil }
+
+func (m *mtpDraft) Unembed(x *mlx.Array) *mlx.Array { return (*Model)(m).Unembed(x) }
+
+// SelfDraft returns the model's drafting view, or nil when no MTP head was
+// loaded. The methods exist either way, so this is what decides availability.
 func (m *Model) SelfDraft() base.DraftModel {
 	if m.MTP == nil {
 		return nil
 	}
-	return m
+	return (*mtpDraft)(m)
 }
 
-// Draft runs one MTP step; the head's hidden also serves as the projected
+// Forward runs one MTP step; the head's hidden also serves as the aux
 // hidden seeding the next step.
-func (m *Model) Draft(b *batch.Batch, caches []cache.Cache) (hidden, projected *mlx.Array) {
+func (m *mtpDraft) Forward(b *batch.Batch, _, draftCaches []cache.Cache) (hidden, auxHidden *mlx.Array) {
 	dims := b.InputIDs.Dims()
 	B, L := int32(dims[0]), int32(dims[1])
 	positions := mlx.FromValues(b.SeqOffsets, len(b.SeqOffsets))
 
-	emb := m.MTP.Enorm.Forward(m.EmbedTokens.Forward(b.InputIDs), m.RMSNormEps)
+	raw := m.EmbedTokens.Forward(b.InputIDs)
+	if len(b.Media) > 0 {
+		// The pair at slot S embeds the look-ahead token S+1, so each row's
+		// column 0 holds the prompt token one past its offset.
+		raw = (*Model)(m).scatterMedia(raw, b, 1)
+	}
+	emb := m.MTP.Enorm.Forward(raw, m.RMSNormEps)
 	h := m.MTP.Hnorm.Forward(b.Hidden, m.RMSNormEps)
 	fused := m.MTP.FC.Forward(emb.Concatenate(-1, h))
 
-	c := m.DraftCaches(caches)[0]
-	out := m.MTP.Layer.Forward(fused, b, c, positions, B, L, m.Config)
+	var mropeCos, mropeSin *mlx.Array
+	if mp := ropePositions(b, L); mp != nil {
+		mropeCos, mropeSin = mropeCosSin(m.Config, mp, L)
+	}
+
+	out := m.MTP.Layer.Forward(fused, b, draftCaches[0], positions, B, L, m.Config, mropeCos, mropeSin)
 	hidden = m.MTP.Norm.Forward(out, m.RMSNormEps)
 	return hidden, hidden
 }
@@ -1263,8 +1317,7 @@ func (m *Model) Tokenizer() *tokenizer.Tokenizer {
 }
 
 func (m *Model) NewCaches() []cache.Cache {
-	// Reserve a trailing slot for the MTP head's KV cache when present.
-	caches := make([]cache.Cache, len(m.Layers), len(m.Layers)+1)
+	caches := make([]cache.Cache, len(m.Layers))
 	convTail := m.LinearConvKernelDim - 1
 	convDim := 2*m.LinearNumKeyHeads*m.LinearKeyHeadDim + m.LinearNumValueHeads*m.LinearValueHeadDim
 	for i, layer := range m.Layers {
@@ -1273,10 +1326,6 @@ func (m *Model) NewCaches() []cache.Cache {
 		} else {
 			caches[i] = cache.NewKVCache()
 		}
-	}
-	// Trailing slot is the MTP head's (DraftCaches); Model.Forward never touches it.
-	if m.MTP != nil {
-		caches = append(caches, cache.NewKVCache())
 	}
 	return caches
 }
