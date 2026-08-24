@@ -50,11 +50,20 @@ jobs:
             echo "No new upstream commits since the last sync."
             exit 0
           fi
-          git merge --no-edit upstream/main
-          # This repo rewrites README.md as its own project page; keep that version.
-          git checkout sync/upstream -- README.md
-          git add README.md
-          git commit --amend --no-edit
+          # Snapshot our workflow files before merge.
+          rm -rf /tmp/our-workflows && mkdir -p /tmp/our-workflows && cp .github/workflows/* /tmp/our-workflows/ 2>/dev/null || true
+          # Use -X ours to keep our version for any conflicts.
+          git merge --no-edit -X ours upstream/main || {
+            echo "Merge had conflicts, resolving with -X ours strategy..."
+            git checkout --ours .
+            git add -A
+            git commit --no-edit
+          }
+          # Restore our exact workflow files (drop upstream additions/modifications).
+          # GitHub Apps cannot push workflow files without `workflows` permission.
+          rm -rf .github/workflows && mkdir -p .github/workflows && cp /tmp/our-workflows/* .github/workflows/ 2>/dev/null || true
+          git add -A
+          git diff --cached --quiet || git commit -m "ci: restore our workflow files after upstream sync"
 
       - name: Push sync branch
         run: git push --force-with-lease origin sync/upstream
