@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 
@@ -73,10 +72,15 @@ type CompleteChunkChoice struct {
 	Logprobs     *ChoiceLogprobs `json:"logprobs,omitempty"`
 }
 
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens        int                  `json:"prompt_tokens"`
+	PromptTokensDetails *PromptTokensDetails `json:"prompt_tokens_details,omitempty"`
+	CompletionTokens    int                  `json:"completion_tokens"`
+	TotalTokens         int                  `json:"total_tokens"`
 }
 
 type ResponseFormat struct {
@@ -239,11 +243,15 @@ func NewError(code int, message string) ErrorResponse {
 
 // ToUsage converts an api.ChatResponse to Usage
 func ToUsage(r api.ChatResponse) Usage {
-	return Usage{
+	usage := Usage{
 		PromptTokens:     r.Metrics.PromptEvalCount,
 		CompletionTokens: r.Metrics.EvalCount,
 		TotalTokens:      r.Metrics.PromptEvalCount + r.Metrics.EvalCount,
 	}
+	if r.Metrics.PromptEvalCachedCount != nil {
+		usage.PromptTokensDetails = &PromptTokensDetails{CachedTokens: *r.Metrics.PromptEvalCachedCount}
+	}
+	return usage
 }
 
 // ToToolCalls converts api.ToolCall to OpenAI ToolCall format
@@ -397,11 +405,15 @@ func FinishChunk(id string, r api.ChatResponse, toolCallSent bool) ChatCompletio
 
 // ToUsageGenerate converts an api.GenerateResponse to Usage
 func ToUsageGenerate(r api.GenerateResponse) Usage {
-	return Usage{
+	usage := Usage{
 		PromptTokens:     r.Metrics.PromptEvalCount,
 		CompletionTokens: r.Metrics.EvalCount,
 		TotalTokens:      r.Metrics.PromptEvalCount + r.Metrics.EvalCount,
 	}
+	if r.Metrics.PromptEvalCachedCount != nil {
+		usage.PromptTokensDetails = &PromptTokensDetails{CachedTokens: *r.Metrics.PromptEvalCachedCount}
+	}
+	return usage
 }
 
 // ToCompletion converts an api.GenerateResponse to Completion
@@ -518,6 +530,31 @@ func ToModel(r api.ShowResponse, m string) Model {
 		Object:  "model",
 		Created: r.ModifiedAt.Unix(),
 		OwnedBy: model.ParseName(m).Namespace,
+	}
+}
+
+// thinkFromReasoningEffort converts an OpenAI reasoning effort to the equivalent
+// Ollama think value. An empty effort leaves thinking at the model's default.
+//
+// OpenAI's scale extends past both ends of Ollama's ("minimal" below "low",
+// "xhigh" above "high"), and clients built on it add tiers of their own
+// ("ultra"). Clamp those to the nearest Ollama tier rather than rejecting the
+// request, since the alternative is a 400 for an effort the client considers
+// perfectly valid.
+func thinkFromReasoningEffort(effort string) (*api.ThinkValue, error) {
+	switch effort {
+	case "":
+		return nil, nil
+	case "none":
+		return &api.ThinkValue{Value: false}, nil
+	case "minimal":
+		return &api.ThinkValue{Value: "low"}, nil
+	case "low", "medium", "high", "max":
+		return &api.ThinkValue{Value: effort}, nil
+	case "xhigh", "ultra":
+		return &api.ThinkValue{Value: "max"}, nil
+	default:
+		return nil, fmt.Errorf("invalid reasoning value: %q (must be \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\", \"ultra\", \"max\", or \"none\")", effort)
 	}
 }
 
@@ -670,7 +707,6 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		}
 	}
 
-	var think *api.ThinkValue
 	var effort string
 
 	if r.Reasoning != nil {
@@ -679,16 +715,9 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		effort = *r.ReasoningEffort
 	}
 
-	if effort != "" {
-		if !slices.Contains([]string{"high", "medium", "low", "max", "none"}, effort) {
-			return nil, fmt.Errorf("invalid reasoning value: '%s' (must be \"high\", \"medium\", \"low\", \"max\", or \"none\")", effort)
-		}
-
-		if effort == "none" {
-			think = &api.ThinkValue{Value: false}
-		} else {
-			think = &api.ThinkValue{Value: effort}
-		}
+	think, err := thinkFromReasoningEffort(effort)
+	if err != nil {
+		return nil, err
 	}
 
 	return &api.ChatRequest{

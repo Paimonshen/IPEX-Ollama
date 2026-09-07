@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 
 	"github.com/ollama/ollama/x/mlxrunner/batch"
@@ -82,6 +83,9 @@ type Model struct {
 	Layers      []*Layer
 	Norm        *nn.RMSNorm
 	LMHead      nn.LinearLayer
+
+	// auxHiddenLayers are the tapped layers; empty means the final hidden.
+	auxHiddenLayers []int
 
 	tok *tokenizer.Tokenizer
 	*Config
@@ -586,18 +590,14 @@ func stackAndClone(parts []*mlx.Array) *mlx.Array {
 	if len(parts) == 0 {
 		return nil
 	}
-	stacked := mlx.Stack(parts, 0).Clone()
-	mlx.Eval(stacked)
-	return stacked
+	return mlx.Stack(parts, 0).Clone()
 }
 
 func transposeExpertWeightForGatherMM(w *mlx.Array) *mlx.Array {
 	if w == nil || !w.Valid() || w.NumDims() != 3 {
 		return w
 	}
-	t := mlx.Transpose(w, 0, 2, 1).Clone()
-	mlx.Eval(t)
-	return t
+	return mlx.Transpose(w, 0, 2, 1).Clone()
 }
 
 func transposeExpertWeightViewForGatherMM(w *mlx.Array) *mlx.Array {
@@ -758,9 +758,7 @@ func fuseExpertStacks(a, b *mlx.Array, axis int) *mlx.Array {
 	if a == nil || !a.Valid() || b == nil || !b.Valid() {
 		return nil
 	}
-	out := mlx.Concatenate([]*mlx.Array{a, b}, axis).Clone()
-	mlx.Eval(out)
-	return out
+	return mlx.Concatenate([]*mlx.Array{a, b}, axis).Clone()
 }
 
 func applyExpertGlobalScale(x, globalScale, idx *mlx.Array) *mlx.Array {
@@ -1065,9 +1063,7 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 				layerPrefix+".mlp.switch_mlp.e_score_correction_bias",
 			)
 			if moe.EScoreCorrectionBias != nil && moe.EScoreCorrectionBias.DType() != mlx.DTypeFloat32 {
-				bias := moe.EScoreCorrectionBias.AsType(mlx.DTypeFloat32).Clone()
-				mlx.Eval(bias)
-				moe.EScoreCorrectionBias = bias
+				moe.EScoreCorrectionBias = moe.EScoreCorrectionBias.AsType(mlx.DTypeFloat32).Clone()
 			}
 
 			gateW := loadStackedProjection(tensors, cfg, useQuantizedExperts,
@@ -1387,14 +1383,15 @@ func (l *Layer) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *
 	return mlx.Add(h, r)
 }
 
-func (m *Model) Forward(b *batch.Batch, caches []cache.Cache) *mlx.Array {
+func (m *Model) Forward(b *batch.Batch, caches []cache.Cache) (hidden, auxHidden *mlx.Array) {
 	dims := b.InputIDs.Dims()
 	B, L := int32(dims[0]), int32(dims[1])
 	return m.forward(b, caches, B, L)
 }
 
-func (m *Model) forward(b *batch.Batch, caches []cache.Cache, B, L int32) *mlx.Array {
+func (m *Model) forward(b *batch.Batch, caches []cache.Cache, B, L int32) (hidden, auxHidden *mlx.Array) {
 	positions := mlx.FromValues(b.SeqOffsets, len(b.SeqOffsets))
+	var features []*mlx.Array
 	h := m.EmbedTokens.Forward(b.InputIDs)
 	for i, layer := range m.Layers {
 		var c cache.Cache
@@ -1402,8 +1399,32 @@ func (m *Model) forward(b *batch.Batch, caches []cache.Cache, B, L int32) *mlx.A
 			c = caches[i]
 		}
 		h = layer.Forward(h, b, c, positions, B, L, m.Config)
+		if slices.Contains(m.auxHiddenLayers, i) {
+			features = append(features, h)
+		}
 	}
-	return m.Norm.Forward(h, m.RMSNormEps)
+	out := m.Norm.Forward(h, m.RMSNormEps)
+	if features != nil {
+		return out, mlx.Concatenate(features, -1)
+	}
+	return out, out
+}
+
+// SetAuxHiddenLayers taps the listed layers' outputs, which Forward then
+// returns as the draft-conditioning state in place of the final hidden.
+func (m *Model) SetAuxHiddenLayers(layers []int) {
+	m.auxHiddenLayers = layers
+}
+
+// TokenEmbeddings is the raw lookup, for a draft that embeds with the
+// target's table.
+func (m *Model) TokenEmbeddings(ids *mlx.Array) *mlx.Array {
+	return m.EmbedTokens.Forward(ids)
+}
+
+// RawLogits matches Unembed: this head applies no output decoration.
+func (m *Model) RawLogits(hidden *mlx.Array) *mlx.Array {
+	return m.LMHead.Forward(hidden)
 }
 
 func (m *Model) Unembed(x *mlx.Array) *mlx.Array {
