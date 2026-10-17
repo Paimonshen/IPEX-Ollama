@@ -68,15 +68,18 @@ jobs:
       - name: Push sync branch
         run: git push --force-with-lease origin sync/upstream
 
-      - name: Open or update pull request
+      - name: Open or update pull request (REST API)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr create \
-            --base main --head sync/upstream \
-            --title "chore: sync upstream ollama/ollama" \
-            --body "Automatically merged the latest [ollama/ollama](https://github.com/ollama/ollama) main into this branch. The Windows build runs on this PR; if auto-merge is enabled it merges when the required check passes." \
-            || true
+          # `gh pr create` uses GraphQL, which can be blocked for GitHub Apps.
+          # The REST endpoint only needs pull_requests: write, so try it first.
+          gh api -X POST "repos/${{ github.repository }}/pulls" \
+            -f title="chore: sync upstream ollama/ollama" \
+            -f head="sync/upstream" \
+            -f base="main" \
+            -f body="Automatically merged the latest ollama/ollama main into this branch. The Windows build runs on this PR; if auto-merge is enabled it merges when the required check passes." \
+            || echo "REST PR creation failed; will fall back to a direct push."
 
       - name: Enable auto-merge on the PR
         env:
@@ -84,3 +87,13 @@ jobs:
         run: |
           gh pr merge sync/upstream --auto --merge || \
             echo "Auto-merge is not enabled for this repo; review and merge the PR manually."
+
+      - name: Fallback - push merged result straight to main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # If no PR could be opened, update main directly so the sync is not lost.
+          if ! gh pr view sync/upstream --json number >/dev/null 2>&1; then
+            echo "No PR found; pushing sync/upstream to main directly."
+            git push origin sync/upstream:main
+          fi
