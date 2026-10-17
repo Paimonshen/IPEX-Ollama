@@ -21,15 +21,16 @@ import (
 	"github.com/ollama/ollama/auth"
 	"github.com/ollama/ollama/envconfig"
 	internalcloud "github.com/ollama/ollama/internal/cloud"
+	"github.com/ollama/ollama/openai"
 	"github.com/ollama/ollama/version"
 )
 
 const (
-	defaultCloudProxyBaseURL      = "https://ollama.com:443"
-	defaultCloudProxySigningHost  = "ollama.com"
-	cloudProxyBaseURLEnv          = "OLLAMA_CLOUD_BASE_URL"
-	legacyCloudAnthropicKey       = "legacy_cloud_anthropic_web_search"
-	cloudProxyClientVersionHeader = "X-Ollama-Client-Version"
+	defaultCloudProxyBaseURL       = "https://ollama.com:443"
+	defaultCloudProxySigningHost   = "ollama.com"
+	cloudProxyBaseURLEnv           = "OLLAMA_CLOUD_BASE_URL"
+	cloudWebSearchOrchestrationKey = "cloud_web_search_orchestration"
+	cloudProxyClientVersionHeader  = "X-Ollama-Client-Version"
 
 	// maxDecompressedBodySize limits the size of a decompressed request body
 	maxDecompressedBodySize = 20 << 20
@@ -120,14 +121,14 @@ func cloudPassthroughMiddleware(disabledOperation string) gin.HandlerFunc {
 			return
 		}
 
-		// TEMP(drifkin): keep Anthropic web search requests on the local middleware
-		// path so WebSearchAnthropicWriter can orchestrate follow-up calls.
-		if c.Request.URL.Path == "/v1/messages" {
-			if hasAnthropicWebSearchTool(body) {
-				c.Set(legacyCloudAnthropicKey, true)
-				c.Next()
-				return
-			}
+		// Keep server-side web search on the local compatibility middleware path.
+		// The converted model requests use Ollama's /api/chat contract, including
+		// for cloud models; all other cloud compatibility traffic remains raw
+		// passthrough.
+		if hasWebSearchTool(c.Request.URL.Path, body) {
+			c.Set(cloudWebSearchOrchestrationKey, true)
+			c.Next()
+			return
 		}
 
 		proxyCloudRequest(c, normalizedBody, disabledOperation)
@@ -163,7 +164,7 @@ func proxyCloudJSONRequest(c *gin.Context, payload any, disabledOperation string
 }
 
 func proxyCloudJSONRequestWithPath(c *gin.Context, payload any, path string, disabledOperation string) {
-	body, err := json.Marshal(payload)
+	body, err := marshalNoHTMLEscape(payload)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -209,7 +210,7 @@ func proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disable
 
 	if err := cloudProxySignRequest(outReq.Context(), outReq); err != nil {
 		slog.Warn("cloud proxy signing failed", "error", err)
-		writeCloudUnauthorized(c)
+		writeCloudUnauthorized(c, path)
 		return
 	}
 
@@ -234,7 +235,7 @@ func proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disable
 	// into WebSearchAnthropicWriter, but this proxy copy loop may coalesce
 	// multiple jsonl records into one Write.  WebSearchAnthropicWriter currently
 	// unmarshals one JSON value per Write.
-	if path == "/api/chat" && resp.StatusCode == http.StatusOK && c.GetBool(legacyCloudAnthropicKey) {
+	if path == "/api/chat" && resp.StatusCode == http.StatusOK && c.GetBool(cloudWebSearchOrchestrationKey) {
 		framedWriter = &jsonlFramingResponseWriter{ResponseWriter: c.Writer}
 		bodyWriter = framedWriter
 	}
@@ -283,7 +284,20 @@ func replaceJSONModelField(body []byte, model string) ([]byte, error) {
 	}
 	payload["model"] = modelJSON
 
-	return json.Marshal(payload)
+	return marshalNoHTMLEscape(payload)
+}
+
+// marshalNoHTMLEscape is json.Marshal without HTML escaping, which would turn
+// each <, >, and & in a client's values into six bytes that count against
+// upstream byte limits.
+func marshalNoHTMLEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
 func readRequestBody(r *http.Request) ([]byte, error) {
@@ -324,8 +338,19 @@ func extractModelField(body []byte) (string, bool) {
 	return model, model != ""
 }
 
-func hasAnthropicWebSearchTool(body []byte) bool {
+func hasWebSearchTool(path string, body []byte) bool {
 	if len(body) == 0 {
+		return false
+	}
+
+	if path == "/v1/responses" {
+		var payload struct {
+			Tools []openai.ResponsesTool `json:"tools"`
+		}
+		return json.Unmarshal(body, &payload) == nil && openai.HasWebSearchTool(payload.Tools)
+	}
+
+	if path != "/v1/messages" {
 		return false
 	}
 
@@ -347,14 +372,23 @@ func hasAnthropicWebSearchTool(body []byte) bool {
 	return false
 }
 
-func writeCloudUnauthorized(c *gin.Context) {
+func writeCloudUnauthorized(c *gin.Context, path string) {
 	signinURL, err := cloudProxySigninURL()
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		signinURL = ""
+	}
+	// Responses passthrough runs before the compatibility writer. Requests
+	// routed through /api/chat (including web search) still need native errors.
+	if path == "/v1/responses" {
+		c.JSON(http.StatusUnauthorized, openai.NewResponsesAuthenticationError(signinURL))
 		return
 	}
 
-	c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized", "signin_url": signinURL})
+	response := gin.H{"error": "unauthorized"}
+	if err == nil {
+		response["signin_url"] = signinURL
+	}
+	c.JSON(http.StatusUnauthorized, response)
 }
 
 func signCloudProxyRequest(ctx context.Context, req *http.Request) error {
@@ -374,9 +408,15 @@ func signCloudProxyRequest(ctx context.Context, req *http.Request) error {
 }
 
 func buildCloudSignatureChallenge(req *http.Request, ts string) string {
-	query := req.URL.Query()
-	query.Set("ts", ts)
-	req.URL.RawQuery = query.Encode()
+	query, err := url.ParseQuery(req.URL.RawQuery)
+	if err != nil {
+		// Preserve malformed queries for the cloud to reject. Its verifier uses
+		// the first timestamp, so prepend ours ahead of any client value.
+		req.URL.RawQuery = "ts=" + ts + "&" + req.URL.RawQuery
+	} else {
+		query.Set("ts", ts)
+		req.URL.RawQuery = query.Encode()
+	}
 
 	return fmt.Sprintf("%s,%s", req.Method, req.URL.RequestURI())
 }
