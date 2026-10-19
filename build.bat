@@ -67,11 +67,18 @@ if /I "%~1"=="configure" goto configure
 if /I "%~1"=="package" goto package
 goto build
 
+rem ---- Level Zero memory path (iGPU memory savings) ----
+rem GGML_SYCL_SUPPORT_LEVEL_ZERO_API enables zeMemAllocDevice allocations.
+rem Upstream defaults this to ON; we pin it explicitly so a future llama.cpp
+rem default change cannot silently double RAM use on Intel iGPUs.
+set "SYCL_LEVEL_ZERO_ARGS=-DGGML_SYCL_SUPPORT_LEVEL_ZERO_API=ON"
+echo Level Zero API support: enabled (GGML_SYCL_SUPPORT_LEVEL_ZERO_API=ON)
+
 :configure
 rem Ninja is used at every level, like llama.cpp's official Windows SYCL
 rem build; cl comes from the vcvars environment above. ccache is disabled
 rem for reproducible builds in restricted environments.
-cmake -S "%SRC%" -B "%BUILD%" -G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DOLLAMA_LLAMA_BACKENDS=sycl -DOLLAMA_VERSION=v0.32.6 -DCMAKE_BUILD_TYPE=Release -DGGML_CCACHE=OFF
+cmake -S "%SRC%" -B "%BUILD%" -G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DOLLAMA_LLAMA_BACKENDS=sycl -DOLLAMA_VERSION=v0.32.6 -DCMAKE_BUILD_TYPE=Release -DGGML_CCACHE=OFF %SYCL_LEVEL_ZERO_ARGS%
 if errorlevel 1 (
   echo configure failed
   exit /b 1

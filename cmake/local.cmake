@@ -817,6 +817,11 @@ if(OLLAMA_HAVE_LLAMA_SERVER)
                 -DBUILD_SHARED_LIBS=ON
                 -DGGML_BACKEND_DL=ON
                 -DGGML_SYCL=ON
+                # Level Zero allocation path (zeMemAllocDevice) — lowers memory
+                # pressure on Intel iGPU by avoiding a second copy of weights in
+                # system RAM. Already the upstream default, pinned here so a
+                # future llama.cpp default change cannot silently drop it.
+                -DGGML_SYCL_SUPPORT_LEVEL_ZERO_API=ON
                 -DOLLAMA_GPU_BACKEND=sycl)
             if(NOT DEFINED GGML_SYCL_F16)
                 list(APPEND _sycl_args -DGGML_SYCL_F16=ON)
