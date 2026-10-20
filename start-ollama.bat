@@ -16,11 +16,13 @@ echo Starting Ollama (SYCL / Intel GPU)...
 echo   GGML_SYCL_USE_LEVEL_ZERO_API=%GGML_SYCL_USE_LEVEL_ZERO_API%
 echo   ONEAPI_DEVICE_SELECTOR=%ONEAPI_DEVICE_SELECTOR%
 echo.
-echo Tip for large models (32B+) on Intel iGPUs:
-echo   Memory roughly doubles because weights are kept both in the OS file
-echo   cache (mmap) and in GPU memory. To avoid this, disable mmap per request:
+echo IMPORTANT for Intel iGPUs (user-verified on i5-1135G7):
+echo   Weights are held twice - once in the OS file cache (mmap) and once in
+echo   device memory - so memory roughly DOUBLES (28GB model - 56GB RAM).
+echo   On an iGPU you should disable mmap per request:
 echo     curl http://127.0.0.1:11434/api/generate -d "{\"model\":\"...\",\"options\":{\"use_mmap\":false}}"
-echo   or reduce offload with a smaller number of GPU layers.
+echo   This removes the duplicate copy and also loads ~3x faster.
+echo   Do NOT use "num_gpu" (partial offload) on an iGPU - it can hang/crash.
 echo.
 
 ollama serve

@@ -47,6 +47,24 @@ llama_prepare_model_devices: using device SYCL0 (Intel(R) Arc(TM) B580 Graphics)
 load_tensors: offloaded 33/33 layers to GPU
 ```
 
+## Intel 核显（iGPU）内存调优
+
+在 Intel 核显（如 i5-1135G7）上跑大模型时，**必须关闭 mmap**，否则内存占用会翻倍：
+
+- 原因：mmap 让权重保留在操作系统文件缓存，SYCL 又会分配一份设备内存；核显的显存与系统内存是同一块物理内存，于是权重实际存了两份（用户实测：28GB 模型占用约 56GB）。
+- 关闭后既省掉重复的一份，**加载速度还快约 3 倍**（均已在 [#2](https://github.com/Paimonshen/IPEX-Ollama/issues/2) 由用户实测确认）。
+
+按请求关闭 mmap：
+
+```bat
+curl http://127.0.0.1:11434/api/generate -d "{\"model\":\"muse_glimmer:30b\",\"prompt\":\"hello\",\"options\":{\"use_mmap\":false}}"
+```
+
+另外两点注意：
+
+- **不要在核显上用 `num_gpu`（部分卸载）**：层被拆分到 CPU/GPU 两侧，而两边共享同一份物理内存，容易挂起甚至崩溃。让 Ollama 自动决定（默认 `num_gpu: -1`）。
+- 需要进一步降低占用时，优先减小 `num_ctx`（上下文长度），而不是部分卸载。
+
 > 如果同时安装了 Vulkan 包，可用 `set OLLAMA_LLM_LIBRARY=sycl` 强制走 SYCL。
 > 多卡时用 `ONEAPI_DEVICE_SELECTOR=level_zero:0;level_zero:1` 选择设备。
 
