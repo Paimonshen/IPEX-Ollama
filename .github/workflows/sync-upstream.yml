@@ -68,7 +68,18 @@ jobs:
       - name: Push sync branch
         run: git push --force-with-lease origin sync/upstream
 
-      - name: Open or update pull request (REST API)
+      - name: Update main directly (primary path)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Direct push is the primary path: workflows started by GITHUB_TOKEN on
+          # pull_request events can sit in action_required (needing manual
+          # approval), so a PR-gated merge is not reliable. Pushing to main
+          # triggers build.yml (on: push branches [main]) and auto-release runs on
+          # workflow_run completion.
+          git push origin sync/upstream:main
+
+      - name: Open or update pull request (REST API, optional audit trail)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -78,22 +89,5 @@ jobs:
             -f title="chore: sync upstream ollama/ollama" \
             -f head="sync/upstream" \
             -f base="main" \
-            -f body="Automatically merged the latest ollama/ollama main into this branch. The Windows build runs on this PR; if auto-merge is enabled it merges when the required check passes." \
-            || echo "REST PR creation failed; will fall back to a direct push."
-
-      - name: Enable auto-merge on the PR
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh pr merge sync/upstream --auto --merge || \
-            echo "Auto-merge is not enabled for this repo; review and merge the PR manually."
-
-      - name: Fallback - push merged result straight to main
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # If no PR could be opened, update main directly so the sync is not lost.
-          if ! gh pr view sync/upstream --json number >/dev/null 2>&1; then
-            echo "No PR found; pushing sync/upstream to main directly."
-            git push origin sync/upstream:main
-          fi
+            -f body="Automatically merged the latest ollama/ollama main into this branch (also pushed straight to main)." \
+            || echo "REST PR creation skipped."

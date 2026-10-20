@@ -1,16 +1,16 @@
 name: auto-release
 
 # Fully automatic releases:
-# - When the weekly "sync upstream" pull request is merged into main, this
-#   workflow creates a version tag (v<upstream-version>-<date>) and starts the
-#   Windows build on that tag. The build then publishes the release with the
-#   zip attached.
+# - When the weekly "sync upstream" workflow completes and has pushed new
+#   commits to main, this workflow creates a version tag
+#   (v<upstream-version>-<date>) and dispatches the Windows build on that tag.
+#   The build then publishes the release with the zip attached.
 # - Can also be run manually any time from Actions -> Auto release.
 
 on:
-  pull_request:
-    types: [closed]
-    branches: [main]
+  workflow_run:
+    workflows: ["sync-upstream"]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   release:
-    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'sync/upstream')
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
