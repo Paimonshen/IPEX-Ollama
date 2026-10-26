@@ -207,6 +207,7 @@ func TestSystemOneHandler(t *testing.T) {
 		{"renamed-clef", "clef", "clef", ""},
 		{"old-clef", "qwen35", "clef", ""},
 		{"laya-native", "modern-bert", "laya", ""},
+		{"renamed-d3", "qwen35", "vllm-d3", ""},
 		{"gguf-tev1", "qwen35", "", "tev1"},
 	} {
 		kv := gguftest.KV{"general.architecture": gguf.architecture}
@@ -268,6 +269,9 @@ func TestSystemOneHandler(t *testing.T) {
 		{"old-format decision GGUF", `{"model":"gguf-tev1","state":"x","questions":{"refund":{"type":"noul","instructions":"q"}}}`, nil, 400, 0, false},
 		{"old-format Clef GGUF", `{"model":"old-clef","state":"x","questions":{"refund":{"type":"noul","instructions":"q"}}}`, nil, 400, 0, false},
 		{"llama.cpp 65 questions", nativeQuestions(65), nil, 400, 0, false},
+		{"vllm-d3 empty state", `{"model":"renamed-d3","state":"","questions":{"refund":{"type":"choice","instructions":"Which reply is shorter?","criteria":{"Yes.":null,"Yes, I can help with that.":null}}}}`, nil, 200, 1, false},
+		{"vllm-d3 whitespace state", `{"model":"renamed-d3","state":" ","questions":{"refund":{"type":"noul","instructions":"q"}}}`, nil, 200, 1, false},
+		{"safetensors empty state", `{"model":"decision-test","state":"","questions":{"refund":{"type":"noul","instructions":"q"}}}`, nil, 400, 0, false},
 		{"llama.cpp empty state", `{"model":"laya-native","state":" ","questions":{"refund":{"type":"noul","instructions":"q"}}}`, nil, 400, 0, false},
 		{"omitted model", `{"state":"x","questions":{"x":{"type":"noul","instructions":"q"}}}`, nil, 400, 0, false},
 		{"blank model", `{"model":" ","state":"x","questions":{"x":{"type":"noul","instructions":"q"}}}`, nil, 400, 0, false},
@@ -297,7 +301,7 @@ func TestSystemOneHandler(t *testing.T) {
 		{"image does not relax text limit", strings.TrimSuffix(largeText, "}") + `,"images":["aW1hZ2U="]}`, nil, 413, 0, false},
 		{"over transport limit", imagePrefix + strings.Repeat("A", 32<<20) + `"]}`, nil, 413, 0, false},
 	}
-	for _, model := range []string{"decision-test", "laya-native"} {
+	for _, model := range []string{"decision-test", "laya-native", "renamed-d3"} {
 		for _, levels := range []int{1, 2, 10, 11} {
 			status, calls := http.StatusBadRequest, 0
 			if levels >= 2 && levels <= 10 {
@@ -315,7 +319,7 @@ func TestSystemOneHandler(t *testing.T) {
 			s := newServerWithMockRunner(t, &runner.mockRunner)
 			s.sched.loadFn = func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
 				runner.contextLength = req.opts.NumCtx
-				ref.model = req.model
+				ref.model.Store(req.model)
 				ref.modelKey = schedulerModelKey(req.model)
 				s.sched.loadedMu.Lock()
 				s.sched.loaded[ref.modelKey] = ref
@@ -333,7 +337,7 @@ func TestSystemOneHandler(t *testing.T) {
 			if w.Code != tt.status || runner.calls != tt.calls {
 				t.Fatalf("status=%d calls=%d body=%s", w.Code, runner.calls, w.Body)
 			}
-			if tt.calls == 0 && tt.err == nil && ref.model != nil {
+			if tt.calls == 0 && tt.err == nil && ref.model.Load() != nil {
 				t.Fatal("loaded a runner for a rejected request")
 			}
 			if strings.HasPrefix(tt.name, "score limits/") && tt.status == http.StatusBadRequest &&
@@ -390,29 +394,34 @@ func TestSystemOneHandler(t *testing.T) {
 					t.Fatal(err)
 				}
 				outputTokens := 2
-				if len(runner.request.Fields) > 0 || runner.native || ref.model.Config.Renderer == "kev" || ref.model.Config.Renderer == "pplx" {
+				if len(runner.request.Fields) > 0 || runner.native || ref.model.Load().Config.Renderer == "kev" || ref.model.Load().Config.Renderer == "pplx" {
 					outputTokens = 0
 				}
 				if response.Answers["refund"].Noul < 0.88 || response.Usage.InputTokens != 123 || response.Usage.OutputTokens != outputTokens {
 					t.Fatalf("incorrect scoring response: %s", w.Body)
 				}
 				if runner.native {
+					if strings.HasPrefix(tt.name, "vllm-d3 ") {
+						if !bytes.Equal(runner.state, sent.State) {
+							t.Fatalf("state changed before native scoring: got %s, want %s", runner.state, sent.State)
+						}
+					}
 					if tt.name == "llama.cpp decision model" && (string(runner.state) != `{"total":1250.0}` || !strings.Contains(w.Body.String(), `"model":"laya-native"`)) {
 						t.Fatalf("request did not pass through: state %s, response %s", runner.state, w.Body)
 					}
 					return
 				}
-				if ref.model.Config.Renderer == "strands" && (len(runner.request.PointerRows) != 1 || len(runner.request.Rows) != 0 || !strings.HasSuffix(runner.request.PointerRows[0].Prompt, "<answer>")) {
+				if ref.model.Load().Config.Renderer == "strands" && (len(runner.request.PointerRows) != 1 || len(runner.request.Rows) != 0 || !strings.HasSuffix(runner.request.PointerRows[0].Prompt, "<answer>")) {
 					t.Fatalf("Strands did not receive pointer inputs: %+v", runner.request)
 				}
-				if ref.model.Config.Renderer == "pplx" && (runner.request.System != "Model-specific scoring instructions." || len(runner.request.Rows) != 1 || runner.request.Rows[0].Question == nil) {
+				if ref.model.Load().Config.Renderer == "pplx" && (runner.request.System != "Model-specific scoring instructions." || len(runner.request.Rows) != 1 || runner.request.Rows[0].Question == nil) {
 					t.Fatalf("Perplexity scorer lost its system prompt or native question: %+v", runner.request)
 				}
 				var prompt string
 				if len(runner.request.Rows) > 0 {
 					prompt = runner.request.Rows[0].Prompt
 				}
-				if ref.model.Config.Renderer == "tev1" && (!strings.Contains(prompt, `"state": "x", "question": "q", "options":`) || strings.Contains(prompt, "Requested field:")) {
+				if ref.model.Load().Config.Renderer == "tev1" && (!strings.Contains(prompt, `"state": "x", "question": "q", "options":`) || strings.Contains(prompt, "Requested field:")) {
 					t.Fatalf("Tev1 did not receive its per-question prompt: %q", prompt)
 				}
 				if len(runner.request.Fields) > 0 {
@@ -423,21 +432,21 @@ func TestSystemOneHandler(t *testing.T) {
 					if len(runner.request.Rows) != 0 {
 						t.Fatal("pointer head must bypass chat templates")
 					}
-				} else if ref.model.HasGoTemplate {
+				} else if ref.model.Load().HasGoTemplate {
 					if !strings.HasPrefix(prompt, "custom:system:Model-specific scoring instructions.\nuser:") || !strings.HasSuffix(prompt, "answer:") {
 						t.Fatalf("scorer did not receive the Modelfile template output: %q", prompt)
 					}
-				} else if ref.model.Config.Renderer == "pplx" {
+				} else if ref.model.Load().Config.Renderer == "pplx" {
 					if prompt != "" {
 						t.Fatalf("Perplexity scorer received a generic rendered prompt: %q", prompt)
 					}
-				} else if ref.model.Config.Renderer == "kev" {
+				} else if ref.model.Load().Config.Renderer == "kev" {
 					if prompt != "" || len(runner.request.State) != 70<<10 || runner.request.Rows[0].Question == nil {
 						t.Fatalf("Kev scorer received a rendered prompt or lost the state/question")
 					}
 				} else {
 					wantPrefix := "<|im_start|>user\n"
-					if ref.model.System != "" {
+					if ref.model.Load().System != "" {
 						wantPrefix = "<|im_start|>system\nModel-specific scoring instructions.<|im_end|>\n<|im_start|>user\n"
 					}
 					if !strings.HasPrefix(prompt, wantPrefix) || !strings.HasSuffix(prompt, "<think>\n\n</think>\n\n") {
