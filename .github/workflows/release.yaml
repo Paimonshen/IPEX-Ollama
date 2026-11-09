@@ -132,15 +132,16 @@ jobs:
             install: https://packages.nvidia.com/prerelease/cuda/13.4.0/local_installers/cuda_13.4.0_windows_x86_64.exe
             cuda-components:
               - '"cudart"'
-              - '"cudart_cross"'
               - '"nvcc"'
-              - '"nvcc_cross"'
-              - '"cublas_cross"'
               - '"cublas_dev"'
               - '"crt"'
               - '"nvvm"'
               - '"nvptxcompiler"'
-            cuda-version: '13.4'
+            cuda-cross-components:
+              - '"cudart_cross"'
+              - '"nvcc_cross"'
+              - '"cublas_cross"'
+            cuda-version: '13.5'
           - os: windows
             arch: amd64
             preset: 'ROCm 7'
@@ -210,7 +211,7 @@ jobs:
             C:\Program Files\AMD\ROCm
             C:\VulkanSDK
             C:\Program Files\NVIDIA\CUDNN
-          key: ${{ matrix.install }}-${{ matrix.cudnn-install }}
+          key: ${{ matrix.install }}-${{ matrix.cudnn-install }}${{ matrix.cuda-cross-install }}
       - if: startsWith(matrix.preset, 'CUDA ') || startsWith(matrix.preset, 'MLX ')
         name: Install CUDA ${{ matrix.cuda-version }}
         run: |
@@ -272,7 +273,7 @@ jobs:
           echo "CUDNN_INCLUDE_PATH=$cudnnRoot\include" | Out-File -FilePath $env:GITHUB_ENV -Append
           echo "CUDNN_LIBRARY_PATH=$cudnnRoot\lib\x64" | Out-File -FilePath $env:GITHUB_ENV -Append
           echo "$cudnnRoot\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - if: ${{ !cancelled() && steps.cache-install.outputs.cache-hit != 'true' }}
+      - if: ${{ success() && steps.cache-install.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: |
@@ -280,7 +281,7 @@ jobs:
             C:\Program Files\AMD\ROCm
             C:\VulkanSDK
             C:\Program Files\NVIDIA\CUDNN
-          key: ${{ matrix.install }}-${{ matrix.cudnn-install }}
+          key: ${{ matrix.install }}-${{ matrix.cudnn-install }}${{ matrix.cuda-cross-install }}
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
         with:
